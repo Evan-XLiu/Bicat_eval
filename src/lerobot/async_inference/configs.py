@@ -1,0 +1,357 @@
+# Copyright 2025 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import torch
+
+from lerobot.robots.config import RobotConfig
+
+from .constants import (
+    DEFAULT_FPS,
+    DEFAULT_INFERENCE_LATENCY,
+    DEFAULT_OBS_QUEUE_TIMEOUT,
+)
+
+# Aggregate function registry for CLI usage
+AGGREGATE_FUNCTIONS = {
+    "weighted_average": lambda old, new: 0.3 * old + 0.7 * new,
+    "latest_only": lambda old, new: new,
+    "average": lambda old, new: 0.5 * old + 0.5 * new,
+    "conservative": lambda old, new: 0.7 * old + 0.3 * new,
+}
+
+
+def get_aggregate_function(name: str) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
+    """Get aggregate function by name from registry."""
+    if name not in AGGREGATE_FUNCTIONS:
+        available = list(AGGREGATE_FUNCTIONS.keys())
+        raise ValueError(f"Unknown aggregate function '{name}'. Available: {available}")
+    return AGGREGATE_FUNCTIONS[name]
+
+
+@dataclass
+class PolicyServerConfig:
+    """Configuration for PolicyServer.
+
+    This class defines all configurable parameters for the PolicyServer,
+    including networking settings and action chunking specifications.
+    """
+
+    # Networking configuration
+    host: str = field(default="localhost", metadata={"help": "Host address to bind the server to"})
+    port: int = field(default=8080, metadata={"help": "Port number to bind the server to"})
+
+    # Timing configuration
+    fps: int = field(default=DEFAULT_FPS, metadata={"help": "Frames per second"})
+    inference_latency: float = field(
+        default=DEFAULT_INFERENCE_LATENCY, metadata={"help": "Target inference latency in seconds"}
+    )
+
+    obs_queue_timeout: float = field(
+        default=DEFAULT_OBS_QUEUE_TIMEOUT, metadata={"help": "Timeout for observation queue in seconds"}
+    )
+
+    def __post_init__(self):
+        """Validate configuration after initialization."""
+        if self.port < 1 or self.port > 65535:
+            raise ValueError(f"Port must be between 1 and 65535, got {self.port}")
+
+        if self.environment_dt <= 0:
+            raise ValueError(f"environment_dt must be positive, got {self.environment_dt}")
+
+        if self.inference_latency < 0:
+            raise ValueError(f"inference_latency must be non-negative, got {self.inference_latency}")
+
+        if self.obs_queue_timeout < 0:
+            raise ValueError(f"obs_queue_timeout must be non-negative, got {self.obs_queue_timeout}")
+
+    @classmethod
+    def from_dict(cls, config_dict: dict) -> "PolicyServerConfig":
+        """Create a PolicyServerConfig from a dictionary."""
+        return cls(**config_dict)
+
+    @property
+    def environment_dt(self) -> float:
+        """Environment time step, in seconds"""
+        return 1 / self.fps
+
+    def to_dict(self) -> dict:
+        """Convert the configuration to a dictionary."""
+        return {
+            "host": self.host,
+            "port": self.port,
+            "fps": self.fps,
+            "environment_dt": self.environment_dt,
+            "inference_latency": self.inference_latency,
+        }
+
+
+@dataclass
+class DatasetRecordingConfig:
+    """Configuration for dataset recording during evaluation.
+
+    This class defines all configurable parameters for recording evaluation
+    rollouts as a LeRobotDataset v3.
+    """
+
+    # Enable/disable recording
+    enabled: bool = field(default=False, metadata={"help": "Enable dataset recording during evaluation"})
+
+    # Dataset identifier (e.g., 'username/eval_yam_async')
+    repo_id: str | None = field(default=None, metadata={"help": "Dataset repository ID (e.g., 'user/eval_dataset')"})
+
+    # Local directory override
+    root: str | Path | None = field(default=None, metadata={"help": "Local directory to store the dataset"})
+
+    # Push to HuggingFace Hub on completion
+    push_to_hub: bool = field(default=False, metadata={"help": "Push dataset to HuggingFace Hub on completion"})
+
+    # Make the dataset private on the Hub
+    private: bool = field(default=True, metadata={"help": "Make the dataset private on HuggingFace Hub"})
+
+    # Tags for the dataset
+    tags: list[str] | None = field(default=None, metadata={"help": "Tags to add to the dataset on the Hub"})
+
+    # Store as video (True) or images (False)
+    use_videos: bool = field(default=True, metadata={"help": "Store camera data as video (True) or images (False)"})
+
+    # Max episode duration in seconds (None = keyboard only)
+    max_episode_seconds: float | None = field(
+        default=None, metadata={"help": "Maximum episode duration in seconds (None for keyboard-only control)"}
+    )
+
+    # Number of episodes to record (None = unlimited, use keyboard to stop)
+    num_episodes: int | None = field(
+        default=None, metadata={"help": "Number of episodes to record (None for unlimited)"}
+    )
+
+    # Number of image writer processes
+    num_image_writer_processes: int = field(
+        default=0, metadata={"help": "Number of subprocesses for saving frames as PNG (0 = threads only)"}
+    )
+
+    # Number of image writer threads per camera
+    num_image_writer_threads_per_camera: int = field(
+        default=4, metadata={"help": "Number of threads per camera for writing frames"}
+    )
+
+    # Video encoding batch size
+    video_encoding_batch_size: int = field(
+        default=1, metadata={"help": "Number of episodes to accumulate before batch encoding videos (1 = immediate encoding)"}
+    )
+
+    # Reset time between episodes
+    reset_time_s: float = field(
+        default=60.0, metadata={"help": "Number of seconds for resetting the environment after each episode"}
+    )
+
+    # Resume recording to an existing dataset
+    resume: bool = field(
+        default=False, metadata={"help": "Resume recording to an existing dataset instead of creating a new one"}
+    )
+
+    # Duration (seconds) for smooth movement to initial position during reset
+    initial_position_blend_s: float = field(
+        default=5.0,
+        metadata={"help": "Duration in seconds to smoothly move to initial position during reset"},
+    )
+
+    def __post_init__(self):
+        """Validate configuration after initialization."""
+        if self.enabled and not self.repo_id:
+            raise ValueError("repo_id must be provided when dataset recording is enabled")
+
+        if self.max_episode_seconds is not None and self.max_episode_seconds <= 0:
+            raise ValueError(f"max_episode_seconds must be positive, got {self.max_episode_seconds}")
+
+        if self.num_episodes is not None and self.num_episodes <= 0:
+            raise ValueError(f"num_episodes must be positive, got {self.num_episodes}")
+
+        if self.root is not None:
+            self.root = Path(self.root)
+
+
+@dataclass
+class RobotClientConfig:
+    """Configuration for RobotClient.
+
+    This class defines all configurable parameters for the RobotClient,
+    including network connection, policy settings, and control behavior.
+    """
+
+    # Policy configuration
+    policy_type: str = field(metadata={"help": "Type of policy to use"})
+
+    # Robot configuration (for CLI usage - robot instance will be created from this)
+    robot: RobotConfig = field(metadata={"help": "Robot configuration"})
+
+    # Policies typically output K actions at max, but we can use less to avoid wasting bandwidth (as actions
+    # would be aggregated on the client side anyway, depending on the value of `chunk_size_threshold`)
+    actions_per_chunk: int = field(metadata={"help": "Number of actions per chunk"})
+
+    # Optional: a LeRobot-saved checkpoint (draccus config.json + weights) loadable
+    # via PreTrainedConfig.from_pretrained / PreTrainedPolicy.from_pretrained.
+    # Leave empty to use the HF-original mode, in which the server constructs the
+    # policy config purely from `policy_config_overrides` (the checkpoint location
+    # for the underlying weights then comes from the policy-specific field, e.g.
+    # MolmoAct2's `--checkpoint_path=allenai/MolmoAct2-SO100_101`).
+    # NOTE: kept after the required fields above so the dataclass rule
+    # "non-default arguments may not follow default arguments" is satisfied.
+    pretrained_name_or_path: str = field(
+        default="",
+        metadata={
+            "help": (
+                "LeRobot-saved checkpoint (HF repo id or local dir). "
+                "Leave empty when using an HF-original checkpoint, in which case "
+                "the policy config is built entirely from --policy_config_overrides."
+            )
+        },
+    )
+
+    # Task instruction for the robot to execute (e.g., 'fold my tshirt')
+    task: str = field(default="", metadata={"help": "Task instruction for the robot to execute"})
+
+    # Network configuration
+    server_address: str = field(default="localhost:8080", metadata={"help": "Server address to connect to"})
+
+    # Device configuration
+    policy_device: str = field(default="cpu", metadata={"help": "Device for policy inference"})
+
+    # Control behavior configuration
+    chunk_size_threshold: float = field(default=0.5, metadata={"help": "Threshold for chunk size control"})
+    fps: int = field(default=DEFAULT_FPS, metadata={"help": "Frames per second"})
+
+    # Aggregate function configuration (CLI-compatible)
+    aggregate_fn_name: str = field(
+        default="weighted_average",
+        metadata={"help": f"Name of aggregate function to use. Options: {list(AGGREGATE_FUNCTIONS.keys())}"},
+    )
+
+    # Optional rename map applied server-side to translate robot observation keys
+    # (e.g. {"observation.images.front": "observation.images.cam_high"}) into the
+    # names baked into the policy's saved processor (`config.image_keys`).
+    rename_map: dict[str, str] = field(
+        default_factory=dict,
+        metadata={
+            "help": (
+                "Rename map applied server-side via the policy preprocessor's "
+                "RenameObservationsProcessorStep, used when the robot's observation "
+                "keys differ from the policy's expected feature keys."
+            )
+        },
+    )
+
+    # Draccus CLI-style overrides shipped to the server and applied to the saved
+    # policy config before the policy is instantiated, e.g.
+    # ``["--norm_tag=so101", "--inference_action_mode=continuous",
+    # "--normalize_gripper=true", "--rtc_config=null"]``. Useful when the
+    # checkpoint's config.json was saved without deployment-specific fields and
+    # the client cannot edit it (e.g. running MolmoAct2 on SO-101 from a
+    # GPU-less robot).
+    policy_config_overrides: list[str] = field(
+        default_factory=list,
+        metadata={
+            "help": (
+                "List of draccus CLI overrides (e.g. '--norm_tag=so101') applied "
+                "server-side to the saved policy config before instantiation."
+            )
+        },
+    )
+
+    # Debug configuration
+    debug_visualize_queue_size: bool = field(
+        default=False, metadata={"help": "Visualize the action queue size"}
+    )
+
+    # Use vocal synthesis to read events
+    play_sounds: bool = field(
+        default=True, metadata={"help": "Use vocal synthesis to announce events (recording, reset, etc.)"}
+    )
+
+    # Dataset recording configuration
+    dataset: DatasetRecordingConfig = field(
+        default_factory=DatasetRecordingConfig,
+        metadata={"help": "Configuration for dataset recording during evaluation"},
+    )
+
+    @property
+    def environment_dt(self) -> float:
+        """Environment time step, in seconds"""
+        return 1 / self.fps
+
+    def __post_init__(self):
+        """Validate configuration after initialization."""
+        if not self.server_address:
+            raise ValueError("server_address cannot be empty")
+
+        if not self.policy_type:
+            raise ValueError("policy_type cannot be empty")
+
+        # `pretrained_name_or_path` is optional: when empty, the server runs in
+        # HF-original mode and builds the policy config from
+        # `policy_config_overrides` only. Require at least one of the two so the
+        # server has something to construct the policy from.
+        if not self.pretrained_name_or_path and not self.policy_config_overrides:
+            raise ValueError(
+                "Either `pretrained_name_or_path` (LeRobot-saved checkpoint) or "
+                "`policy_config_overrides` (HF-original checkpoint, e.g. "
+                "'--checkpoint_path=allenai/MolmoAct2-SO100_101') must be set."
+            )
+
+        if not self.policy_device:
+            raise ValueError("policy_device cannot be empty")
+
+        if self.chunk_size_threshold < 0 or self.chunk_size_threshold > 1:
+            raise ValueError(f"chunk_size_threshold must be between 0 and 1, got {self.chunk_size_threshold}")
+
+        if self.fps <= 0:
+            raise ValueError(f"fps must be positive, got {self.fps}")
+
+        if self.actions_per_chunk <= 0:
+            raise ValueError(f"actions_per_chunk must be positive, got {self.actions_per_chunk}")
+
+        self.aggregate_fn = get_aggregate_function(self.aggregate_fn_name)
+
+    @classmethod
+    def from_dict(cls, config_dict: dict) -> "RobotClientConfig":
+        """Create a RobotClientConfig from a dictionary."""
+        return cls(**config_dict)
+
+    def to_dict(self) -> dict:
+        """Convert the configuration to a dictionary."""
+        return {
+            "server_address": self.server_address,
+            "policy_type": self.policy_type,
+            "pretrained_name_or_path": self.pretrained_name_or_path,
+            "policy_device": self.policy_device,
+            "chunk_size_threshold": self.chunk_size_threshold,
+            "fps": self.fps,
+            "actions_per_chunk": self.actions_per_chunk,
+            "task": self.task,
+            "debug_visualize_queue_size": self.debug_visualize_queue_size,
+            "aggregate_fn_name": self.aggregate_fn_name,
+            "rename_map": dict(self.rename_map),
+            "policy_config_overrides": list(self.policy_config_overrides),
+            "dataset": {
+                "enabled": self.dataset.enabled,
+                "repo_id": self.dataset.repo_id,
+                "root": str(self.dataset.root) if self.dataset.root else None,
+                "push_to_hub": self.dataset.push_to_hub,
+                "use_videos": self.dataset.use_videos,
+                "max_episode_seconds": self.dataset.max_episode_seconds,
+            },
+        }
